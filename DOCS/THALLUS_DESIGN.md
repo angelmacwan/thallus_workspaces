@@ -15,9 +15,15 @@
 11. [Sprint Lifecycle Engine](#11-sprint-lifecycle-engine)
 12. [Tech Stack](#12-tech-stack)
 13. [Key Flows (Step-by-Step)](#13-key-flows-step-by-step)
-14. [Open Questions & Future Work](#14-open-questions--future-work)
+14. [Design Decisions (Resolved)](#14-design-decisions-resolved)
+15. [REST API Reference](#15-rest-api-reference)
+16. [WebSocket Events](#16-websocket-events)
+17. [Project Codebase Structure](#17-project-codebase-structure)
+18. [Environment & Setup](#18-environment--setup)
+19. [Future Work (Post-MVP)](#19-future-work-post-mvp)
 
-> **Added in rev 1.1:** Global project DB, user-as-participant in team chat, agent `ask_user` blocking, create-agent UI wizard, file upload from UI.
+> **rev 1.1:** Global project DB, user-as-participant in team chat, agent `ask_user` blocking, create-agent UI wizard, file upload from UI.  
+> **rev 1.2:** DB indexes, LLM agent response format, resolved all design decisions, REST API reference, WebSocket event spec, project codebase structure, environment & setup guide.
 
 ---
 
@@ -71,14 +77,15 @@ A web UI exposes a Kanban board, Burndown/Burnup charts, sprint reports, and a s
 
 ### Core Components
 
-| Component              | Responsibility                                                                |
-| ---------------------- | ----------------------------------------------------------------------------- |
-| **Sprint Engine**      | Manages sprint lifecycle phases, story state transitions, standup collection  |
-| **Agent Orchestrator** | Resolves next action per agent, calls LLM, executes tools, handles escalation |
-| **Communication Bus**  | Shared team chat with @mention routing, message persistence                   |
-| **Tool Runtime**       | Sandboxed execution of agent tools with blacklist enforcement                 |
-| **LLM Gateway**        | Routes requests to cloud (OpenAI, Anthropic, etc.) or local (Ollama) models   |
-| **SQLite DB**          | Single source of truth for all workspace state                                |
+| Component               | Responsibility                                                                                          |
+| ----------------------- | ------------------------------------------------------------------------------------------------------- |
+| **Sprint Engine**       | Manages sprint lifecycle phases, story state transitions, standup collection                            |
+| **Agent Orchestrator**  | Resolves next action per agent, calls LLM, executes tools, handles escalation                           |
+| **Communication Bus**   | Shared team chat, @mention routing, user Q&A blocking (`ask_user`), message persistence                 |
+| **Tool Runtime**        | Sandboxed execution of agent tools with blacklist + path enforcement                                    |
+| **LLM Gateway**         | Routes requests to cloud APIs (OpenAI, Anthropic, Nvidia NIM API, etc.) via LangChain per `llm_configs` |
+| **Workspace SQLite DB** | Single source of truth for all workspace state (agents, stories, chat, sprints)                         |
+| **Global SQLite DB**    | App-level workspace registry (`~/.thallus/global.db`) — powers the Home screen                          |
 
 ---
 
@@ -93,6 +100,8 @@ USER_WORKSPACE/
 │   │   ├── AGENT_DATA_ENGINEER.md
 │   │   ├── AGENT_QA.md
 │   │   └── AGENT_{NAME}.md          ← One file per agent (see Agent MD spec below)
+│   ├── AGENTS-TEMPLATES/            ← Cloned from https://github.com/VoltAgent/awesome-claude-code-subagents.git
+│   │   └── *.md                     ← Available templates (backend reads file names)
 │   └── DATA/
 │       ├── DB.SQL                   ← SQLite database (all state)
 │       └── logs/                    ← Execution logs by agent + sprint
@@ -157,6 +166,10 @@ You can escalate to the Scrum Master if blocked for more than one iteration.
 	"sprint_duration_iterations": 10,
 	"standup_every_n_iterations": 1,
 	"command_whitelist": [],
+	"llm_providers": {
+		"default": "nvidia-nim",
+		"options": ["nvidia-nim", "openai", "anthropic", "google"]
+	},
 	"venv": {
 		"python": true,
 		"node": false
@@ -165,7 +178,7 @@ You can escalate to the Scrum Master if blocked for more than one iteration.
 ```
 
 > **Model configuration is stored in the database (`llm_configs` table), not in this file.**  
-> API keys are never persisted — they are read from environment variables at runtime (referenced by `llm_configs.api_key_env`).
+> API keys are never persisted — they are read from environment variables at runtime (referenced by `llm_configs.api_key_env`). LangChain is used to simplify the LLM provider lists and configurations in the backend, supporting providers like Nvidia NIM API natively.
 
 ---
 
@@ -189,13 +202,13 @@ CREATE TABLE workspaces (
 -- LLM CONFIGS (available models catalog)
 -- ─────────────────────────────────────────
 CREATE TABLE llm_configs (
-    id           TEXT PRIMARY KEY,        -- e.g. "gpt4o", "llama3_local"
+    id           TEXT PRIMARY KEY,        -- e.g. "gpt4o", "meta/llama3-70b-instruct"
     display_name TEXT NOT NULL,           -- "GPT-4o (OpenAI)"
-    provider     TEXT NOT NULL,           -- "openai" | "anthropic" | "google" | "ollama" | "custom"
-    model_name   TEXT NOT NULL,           -- "gpt-4o", "llama3", "claude-3-5-sonnet-20241022"
-    model_type   TEXT NOT NULL,           -- "cloud" | "local"
-    base_url     TEXT,                    -- required for local/custom (e.g. "http://localhost:11434")
-    api_key_env  TEXT,                    -- env var name holding the key, e.g. "OPENAI_API_KEY"
+    provider     TEXT NOT NULL,           -- "openai" | "anthropic" | "google" | "nvidia-nim" | "custom"
+    model_name   TEXT NOT NULL,           -- "gpt-4o", "meta/llama3-70b-instruct", "claude-3-5-sonnet-20241022"
+    model_type   TEXT NOT NULL,           -- "api"
+    base_url     TEXT,                    -- required for custom API bases
+    api_key_env  TEXT,                    -- env var name holding the key, e.g. "OPENAI_API_KEY", "NVIDIA_API_KEY"
     context_window INTEGER,               -- optional, for capacity planning
     is_active    BOOLEAN DEFAULT TRUE,    -- user can disable without deleting
     created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -209,6 +222,7 @@ CREATE TABLE agents (
     workspace_id          TEXT REFERENCES workspaces(id),
     name                  TEXT NOT NULL,
     role                  TEXT NOT NULL,
+    template_name         TEXT,               -- Name of the template if instantiated from AGENTS-TEMPLATES
     llm_config_id         TEXT REFERENCES llm_configs(id), -- which model this agent uses
     capabilities          JSON,               -- ["code", "review", ...]
     access                JSON,               -- {private_dir, shared_drive, ...}
@@ -389,6 +403,27 @@ Rules:
 - `last_accessed` updated every time the workspace is opened in the UI.
 - If a workspace folder is deleted or moved externally, the entry remains with a `missing` indicator shown in UI.
 - API keys and secrets are **never** stored here.
+
+### Recommended DB Indexes
+
+Add these to the workspace DB after `CREATE TABLE` statements:
+
+```sql
+CREATE INDEX idx_agents_workspace        ON agents(workspace_id);
+CREATE INDEX idx_agents_status           ON agents(status);
+CREATE INDEX idx_epics_workspace         ON epics(workspace_id);
+CREATE INDEX idx_sprints_workspace       ON sprints(workspace_id, status);
+CREATE INDEX idx_stories_sprint          ON stories(sprint_id);
+CREATE INDEX idx_stories_status          ON stories(status);
+CREATE INDEX idx_stories_workspace       ON stories(workspace_id);
+CREATE INDEX idx_messages_workspace      ON messages(workspace_id, created_at);
+CREATE INDEX idx_messages_requires_reply ON messages(requires_reply)
+    WHERE requires_reply = TRUE;
+CREATE INDEX idx_tool_executions_agent   ON tool_executions(agent_id, executed_at);
+CREATE INDEX idx_standups_sprint         ON standups(sprint_id, iteration);
+CREATE INDEX idx_story_events_story      ON story_events(story_id, created_at);
+CREATE INDEX idx_uploads_workspace       ON uploads(workspace_id);
+```
 
 ---
 
@@ -699,14 +734,13 @@ if not venv_path.exists():
 
 ## 9. Model & LLM Layer
 
-### Two Model Types
+### Cloud API Models
 
-| Type      | Examples                               | Use Case                                                 |
-| --------- | -------------------------------------- | -------------------------------------------------------- |
-| **Cloud** | GPT-4o, Claude 3.5, Gemini 1.5         | High-capability agents (Manager, Reviewer, Scrum Master) |
-| **Local** | Llama 3 via Ollama, Mistral, CodeLlama | Cost-sensitive or privacy-sensitive agents               |
+| Type    | Examples                                       | Use Case                                                                                                           |
+| ------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| **API** | GPT-4o, Claude 3.5, Gemini 1.5, Nvidia NIM API | All agents interact natively with cloud APIs. Nvidia NIM API is the default for cost-sensitive local replacements. |
 
-Available models are registered in the `llm_configs` table. Agent-to-model assignment is stored in `agents.llm_config_id`. The `.md` file contains only the agent's role, capabilities, and system prompt — **not** the model.
+Available models are registered in the `llm_configs` table. Agent-to-model assignment is stored in `agents.llm_config_id`. The backend utilizes **LangChain** to interface with these LLM API providers, offering out-of-the-box support for Nvidia NIM API, OpenAI, Anthropic, and Google. The `.md` file contains only the agent's role, capabilities, and system prompt — **not** the model.
 
 ### Per-Agent Model Assignment
 
@@ -714,13 +748,12 @@ Each agent has a `llm_config_id` column in the `agents` table that references a 
 
 **Example `llm_configs` rows:**
 
-| id                | display_name      | provider  | model_name                 | model_type | base_url               | api_key_env         |
-| ----------------- | ----------------- | --------- | -------------------------- | ---------- | ---------------------- | ------------------- |
-| `gpt4o`           | GPT-4o (OpenAI)   | openai    | gpt-4o                     | cloud      | —                      | `OPENAI_API_KEY`    |
-| `claude_sonnet`   | Claude 3.5 Sonnet | anthropic | claude-3-5-sonnet-20241022 | cloud      | —                      | `ANTHROPIC_API_KEY` |
-| `gemini_15`       | Gemini 1.5 Pro    | google    | gemini-1.5-pro             | cloud      | —                      | `GOOGLE_API_KEY`    |
-| `llama3_local`    | Llama 3 (local)   | ollama    | llama3                     | local      | http://localhost:11434 | —                   |
-| `codellama_local` | CodeLlama (local) | ollama    | codellama                  | local      | http://localhost:11434 | —                   |
+| id              | display_name      | provider   | model_name                 | model_type | base_url | api_key_env         |
+| --------------- | ----------------- | ---------- | -------------------------- | ---------- | -------- | ------------------- |
+| `gpt4o`         | GPT-4o (OpenAI)   | openai     | gpt-4o                     | api        | —        | `OPENAI_API_KEY`    |
+| `claude_sonnet` | Claude 3.5 Sonnet | anthropic  | claude-3-5-sonnet-20241022 | api        | —        | `ANTHROPIC_API_KEY` |
+| `gemini_15`     | Gemini 1.5 Pro    | google     | gemini-1.5-pro             | api        | —        | `GOOGLE_API_KEY`    |
+| `nim_llama3`    | Llama 3 (NIM)     | nvidia-nim | meta/llama3-70b-instruct   | api        | —        | `NVIDIA_API_KEY`    |
 
 Users manage this table from **Workspace Settings → Models** in the UI: add, edit, disable, or delete model configs. Agents are then assigned a config from a dropdown.
 
@@ -747,12 +780,71 @@ class LLMGateway:
 
 Each agent call receives:
 
-1. **System Prompt** — from agent `.md` file + current role constraints
+1. **System Prompt** — from agent `.md` file + current role constraints + mandatory response format instruction (see below)
 2. **Sprint Context** — current sprint goal, active stories
 3. **My Stories** — assigned stories with full AC and status
-4. **Recent Chat** — last N messages from team chat (including @mentions to this agent)
-5. **Recent Standup** — last standup from this agent
-6. **Tool Definitions** — available tools in JSON schema format
+4. **Recent Chat** — last 50 messages from team chat (including @mentions to this agent); older history is excluded for MVP
+5. **User replies** — any `user_reply` messages with `reply_to_id` matching this agent's questions, injected as high-priority context ahead of chat history
+6. **Recent Standup** — last standup from this agent
+7. **Tool Definitions** — available tools in JSON schema format
+
+### LLM Agent Response Format
+
+Every agent LLM call **must** return a structured JSON object. The orchestrator appends the following instruction to every system prompt:
+
+> "You must respond only with a valid JSON object matching the schema below. No prose outside the JSON."
+
+**Response schema:**
+
+```json
+{
+	"thoughts": "Brief private reasoning — logged for debugging, never shown in UI",
+	"actions": [
+		{
+			"type": "tool_call",
+			"tool": "write_file",
+			"args": {
+				"path": "AGENT_DATA_ENGINEER_FILES/pipeline.py",
+				"content": "..."
+			}
+		},
+		{
+			"type": "tool_call",
+			"tool": "run_command",
+			"args": { "cmd": "pytest", "args": ["AGENT_DATA_ENGINEER_FILES/"] }
+		},
+		{
+			"type": "post_message",
+			"content": "Pipeline complete. Output at SHARED_DRIVE/datasets/processed/",
+			"mentions": []
+		},
+		{
+			"type": "update_story_status",
+			"story_id": "STORY-7",
+			"status": "review"
+		}
+	]
+}
+```
+
+**Action types:**
+
+| `type`                | Required fields                  | Description                                                                    |
+| --------------------- | -------------------------------- | ------------------------------------------------------------------------------ |
+| `tool_call`           | `tool`, `args`                   | Execute a registered tool. Args are validated before execution.                |
+| `post_message`        | `content`, `mentions`            | Post to team chat. `mentions` is an array of agent IDs or `"user"`.            |
+| `update_story_status` | `story_id`, `status`             | Transition a story's state.                                                    |
+| `ask_user`            | `question`, `story_id`           | Post a blocking question to the user. **Must be the last action in the list.** |
+| `escalate`            | `story_id`, `reason`             | Flag a blocker to the Scrum Master.                                            |
+| `refuse`              | `story_id`, `reason`             | Decline the story with explanation.                                            |
+| `standup`             | `yesterday`, `today`, `blockers` | Submit standup report. Only valid on standup iterations.                       |
+
+**Execution rules:**
+
+- Actions execute **in order**.
+- If a `tool_call` is blocked by the sandbox, the error is logged and execution continues with the next action.
+- `ask_user` must be the **last** action — the orchestrator will not execute anything after it.
+- If the LLM returns malformed JSON, the orchestrator retries once with an explicit correction prompt; if it fails again, the agent is set to `blocked` and the Scrum Master is notified.
 
 ---
 
@@ -847,24 +939,29 @@ Per sprint:
 The "+ New Agent" button opens a step-by-step form:
 
 ```
-Step 1 — Identity
+Step 1 — Creation Method
+  [ Use Template ▼ ] (Select from AGENTS-TEMPLATES folder)
+  OR
+  [ Custom Agent ] (Define using text input below)
+
+Step 2 — Identity
   Name: _______________
   Role: [Developer | Data Engineer | QA | Researcher | ML Engineer | Custom...]
   Description: (optional short bio shown in chat)
 
-Step 2 — Model
+Step 3 — Model
   Assign LLM: [GPT-4o (OpenAI) ▼]   ← dropdown lists all active rows from llm_configs table
-  (cloud/local type is derived automatically from the selected config)
+  (type is derived automatically from the selected config; uses LangChain in backend)
 
-Step 3 — Capabilities
+Step 4 — Capabilities (Auto-filled if using template)
   ☑ code  ☑ file_read  ☑ file_write  ☐ web_search  ☑ run_command  ...
   Max concurrent stories: [2]
 
-Step 4 — System Prompt
+Step 5 — System Prompt (Auto-filled or read-only if using template)
   [Large textarea with default template pre-filled based on role]
-  User can edit freely.
+  User can edit freely if "Custom Agent" is selected.
 
-Step 5 — Access
+Step 6 — Access
   SHARED_DRIVE access: [read_write ▼]
   Other agents' files: [none ▼]   (always 'none' — not configurable)
 
@@ -873,9 +970,10 @@ Step 5 — Access
 
 On submit:
 
-1. Backend writes `THALLUS/AGENTS/AGENT_{NAME}.md` with YAML frontmatter + system prompt
-2. Inserts row into `agents` table
-3. Creates `AGENT_{NAME}_FILES/` directory
+1. If **Custom Agent**: Backend writes `THALLUS/AGENTS/AGENT_{NAME}.md` with YAML frontmatter + system prompt.
+   If **Template**: Backend only saves the template name in the `agents` DB table (`template_name` column) — template files are NOT copied over individually to save space.
+2. Inserts row into `agents` table.
+3. Creates `AGENT_{NAME}_FILES/` directory.
 4. Posts system message to chat: `[SYSTEM] New agent "Name" joined the team.`
 
 #### 7. File Upload
@@ -1022,16 +1120,16 @@ Stored in `SHARED_DRIVE/docs/SPRINT_{N}_RETRO.md`
 
 ### Backend
 
-| Component     | Technology                                                 |
-| ------------- | ---------------------------------------------------------- |
-| API Server    | **FastAPI** (Python)                                       |
-| Database      | **SQLite** via `sqlalchemy` + `aiosqlite`                  |
-| Task Queue    | **asyncio** task loop (no external queue needed for local) |
-| LLM — Cloud   | `openai`, `anthropic`, `google-generativeai` SDKs          |
-| LLM — Local   | **Ollama** REST API                                        |
-| File Watching | `watchfiles` or `watchdog`                                 |
-| WebSockets    | FastAPI built-in `WebSocket`                               |
-| Config        | `pydantic-settings`                                        |
+| Component     | Technology                                                             |
+| ------------- | ---------------------------------------------------------------------- |
+| API Server    | **FastAPI** (Python)                                                   |
+| Database      | **SQLite** via `sqlalchemy` + `aiosqlite`                              |
+| Task Queue    | **asyncio** task loop (no external queue needed for local)             |
+| LLM Framework | **LangChain** (handles diverse providers and config simplify)          |
+| LLM APIs      | `openai`, `anthropic`, `google-generativeai` SDKs + **Nvidia NIM API** |
+| File Watching | `watchfiles` or `watchdog`                                             |
+| WebSockets    | FastAPI built-in `WebSocket`                                           |
+| Config        | `pydantic-settings`                                                    |
 
 ### Frontend
 
@@ -1162,7 +1260,7 @@ User opens Agents Panel → clicks "+ New Agent"
 → Completes wizard:
     Name: "Legal Reviewer"
     Role: Custom
-    Model: cloud/gpt-4o
+    LLM: GPT-4o (OpenAI)   ← selected from llm_configs dropdown
     Capabilities: file_read, web_search
     System Prompt: "You review outputs for legal compliance..."
 → Clicks "Create Agent"
@@ -1191,31 +1289,380 @@ User clicks "Upload" in sidebar
 
 ---
 
-## 14. Open Questions & Future Work
+## 14. Design Decisions (Resolved)
 
-### Phase 2 Features (post-MVP)
+All decisions below are **locked for MVP**. Do not re-open unless there is a concrete implementation blocker.
 
-| Feature                         | Notes                                                                       |
-| ------------------------------- | --------------------------------------------------------------------------- |
-| **Agent memory**                | Per-agent vector store (ChromaDB/FAISS) for long-term memory across sprints |
-| **Tool marketplace**            | User-installable tools (GitHub, Jira, Notion connectors)                    |
-| **Agent collaboration graph**   | Visualize who's talking to whom and dependencies                            |
-| **Streaming LLM output**        | Show agent "thinking" in real-time in UI                                    |
-| **Human-in-the-loop stories**   | Mark a story as requiring user approval before it moves to `done`           |
-| **Export sprint report**        | PDF/Markdown export of sprint summary                                       |
-| **Diff viewer**                 | Side-by-side code diff when Reviewer submits feedback                       |
-| **Shared Drive file browser**   | Full tree view with preview for text, CSV, JSON, Markdown, images           |
-| **Upload to agent private dir** | Currently only SHARED_DRIVE; extend picker to agent-specific dirs           |
-
-### Design Decisions To Confirm
-
-1. **Iteration trigger**: auto-run continuously, or user presses "Run Iteration"? — Recommend: user triggers each sprint start, then auto-runs iterations with pause button.
-2. **Parallelism**: run all agents concurrently per iteration (faster but harder to debug) or sequentially (slower, easier to trace)?
-3. **Agent chat as LLM context**: include only last N messages or summarize older history?
-4. **Model fallback**: if cloud model fails, auto-fallback to local, or halt and notify user?
-5. **User reply timeout**: should agents be unblocked after N iterations without a user reply (with a warning), or stay paused indefinitely?
-6. **Upload destination enforcement**: should users be prevented from uploading to `THALLUS/` in the UI, or just disallowed by the path sandbox in the backend?
+| #   | Decision                           | Resolution                                                                                                                                                                                                                                                                                                                                           |
+| --- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **Iteration trigger**              | User triggers sprint start; iterations then auto-run with a Pause button. User can also manually trigger a single iteration for debugging.                                                                                                                                                                                                           |
+| 2   | **Agent parallelism**              | **Sequential** for MVP — agents run one at a time per iteration. Simpler to trace, easier to debug. Add parallelism in a later version.                                                                                                                                                                                                              |
+| 3   | **Agent chat context window**      | Include the **last 50 messages** from team chat. Summarization of older messages is a post-MVP feature.                                                                                                                                                                                                                                              |
+| 4   | **Model fallback**                 | If a cloud model call fails (timeout, API error), **halt that agent's iteration** and post a system error message to chat. Do not silently fall back — the user must correct the issue.                                                                                                                                                              |
+| 5   | **User reply timeout**             | Agents remain in `AWAITING_USER` indefinitely. After **3 iterations** with no reply, the Scrum Master posts a reminder in chat. No automatic unblocking.                                                                                                                                                                                             |
+| 6   | **Upload path enforcement**        | Enforced **in both places**: the UI picker never shows `THALLUS/` as a destination, and the backend path sandbox rejects any upload path targeting `THALLUS/`. Defense in depth.                                                                                                                                                                     |
+| 7   | **`llm_configs` scope**            | `llm_configs` is **workspace-scoped** (lives in the workspace DB). Each workspace manages its own model catalog. When a new workspace is created, three default configs are seeded: `gpt4o`, `claude_sonnet`, and `llama3_local`.                                                                                                                    |
+| 8   | **Source of truth: DB vs MD file** | The **DB is the source of truth** for agent runtime state (status, llm_config_id, current_story, etc.). The **MD file is the source of truth** for system prompt and capabilities. On startup, the backend reads all MD files and upserts agent rows into the DB. If a field exists in both (e.g. `capabilities`), the MD file wins on next startup. |
+| 9   | **Malformed LLM response**         | Retry once with a correction prompt. On second failure, set agent status to `blocked`, log the raw output, and notify Scrum Master via chat.                                                                                                                                                                                                         |
+| 10  | **Frontend serving**               | In development: React on Vite (`localhost:5173`), FastAPI on `localhost:8000`, with Vite proxy for API. In production: FastAPI serves the built React bundle as static files from `/` .                                                                                                                                                              |
 
 ---
 
-_Document maintained by: Statica Labs + Thallus System_
+## 15. REST API Reference
+
+Base URL: `http://localhost:8000/api`  
+All endpoints return JSON. Error responses use `{ "detail": "..." }`.
+
+### Global
+
+| Method   | Path                      | Description                                   |
+| -------- | ------------------------- | --------------------------------------------- |
+| `GET`    | `/global/workspaces`      | List all registered workspaces from global DB |
+| `POST`   | `/global/workspaces`      | Register a new or existing workspace          |
+| `PATCH`  | `/global/workspaces/{id}` | Update name or description                    |
+| `DELETE` | `/global/workspaces/{id}` | Remove from registry (does not delete files)  |
+
+### LLM Configs
+
+| Method   | Path                             | Description                                  |
+| -------- | -------------------------------- | -------------------------------------------- |
+| `GET`    | `/{wid}/llm-configs`             | List all configs (active + inactive)         |
+| `POST`   | `/{wid}/llm-configs`             | Add a new model config                       |
+| `PUT`    | `/{wid}/llm-configs/{id}`        | Update config (name, base_url, etc.)         |
+| `PATCH`  | `/{wid}/llm-configs/{id}/toggle` | Enable / disable config                      |
+| `DELETE` | `/{wid}/llm-configs/{id}`        | Delete config (blocked if any agent uses it) |
+
+### Agents
+
+| Method   | Path                      | Description                                          |
+| -------- | ------------------------- | ---------------------------------------------------- |
+| `GET`    | `/{wid}/agents`           | List all agents with current status                  |
+| `POST`   | `/{wid}/agents`           | Create agent (wizard submit)                         |
+| `GET`    | `/{wid}/agents/{aid}`     | Get agent details + recent log                       |
+| `PUT`    | `/{wid}/agents/{aid}`     | Update agent (capabilities, access, max_stories)     |
+| `PATCH`  | `/{wid}/agents/{aid}/llm` | Reassign `llm_config_id`                             |
+| `DELETE` | `/{wid}/agents/{aid}`     | Delete agent (blocked if assigned to active stories) |
+| `GET`    | `/{wid}/agents/{aid}/log` | Paginated tool execution log for this agent          |
+
+### Epics
+
+| Method  | Path                        | Description               |
+| ------- | --------------------------- | ------------------------- |
+| `GET`   | `/{wid}/epics`              | List all epics            |
+| `POST`  | `/{wid}/epics`              | Create epic               |
+| `GET`   | `/{wid}/epics/{eid}`        | Get epic detail           |
+| `PUT`   | `/{wid}/epics/{eid}`        | Update epic               |
+| `PATCH` | `/{wid}/epics/{eid}/status` | Archive / reactivate epic |
+
+### Sprints
+
+| Method | Path                            | Description                                                  |
+| ------ | ------------------------------- | ------------------------------------------------------------ |
+| `GET`  | `/{wid}/sprints`                | List sprints (optionally filter by epic)                     |
+| `POST` | `/{wid}/sprints`                | Create sprint                                                |
+| `GET`  | `/{wid}/sprints/{sid}`          | Get sprint detail + current iteration                        |
+| `POST` | `/{wid}/sprints/{sid}/start`    | Transition sprint to `active` (triggers Phase 1 planning)    |
+| `POST` | `/{wid}/sprints/{sid}/iterate`  | Run one iteration of the execution loop                      |
+| `POST` | `/{wid}/sprints/{sid}/pause`    | Pause the sprint (stops auto-iteration)                      |
+| `POST` | `/{wid}/sprints/{sid}/resume`   | Resume auto-iteration                                        |
+| `GET`  | `/{wid}/sprints/{sid}/report`   | Full sprint report (stories, velocity, outcomes)             |
+| `GET`  | `/{wid}/sprints/{sid}/burndown` | Burndown data points `[{ iteration, points_remaining }]`     |
+| `GET`  | `/{wid}/sprints/{sid}/burnup`   | Burnup data points `[{ iteration, completed, total_scope }]` |
+| `GET`  | `/{wid}/sprints/{sid}/standups` | All standup entries for the sprint                           |
+
+### Stories
+
+| Method   | Path                          | Description                                                                 |
+| -------- | ----------------------------- | --------------------------------------------------------------------------- |
+| `GET`    | `/{wid}/stories`              | List stories. Query params: `sprint_id`, `epic_id`, `status`, `assigned_to` |
+| `POST`   | `/{wid}/stories`              | Create story                                                                |
+| `GET`    | `/{wid}/stories/{sid}`        | Get story detail + events log                                               |
+| `PUT`    | `/{wid}/stories/{sid}`        | Update story (title, description, AC, points, dependencies)                 |
+| `DELETE` | `/{wid}/stories/{sid}`        | Delete story (blocked if `in_progress`)                                     |
+| `PATCH`  | `/{wid}/stories/{sid}/status` | Manually change story status                                                |
+| `PATCH`  | `/{wid}/stories/{sid}/assign` | Reassign story to different agent(s)                                        |
+| `PATCH`  | `/{wid}/stories/{sid}/sprint` | Move story to a different sprint                                            |
+
+### Chat & Messages
+
+| Method | Path                          | Description                                                                     |
+| ------ | ----------------------------- | ------------------------------------------------------------------------------- |
+| `GET`  | `/{wid}/messages`             | Paginated messages. Query: `sprint_id`, `type`, `limit`, `before` (cursor)      |
+| `POST` | `/{wid}/messages`             | User posts a chat message. Body: `{ content, mentions }`                        |
+| `POST` | `/{wid}/messages/{mid}/reply` | User replies to an `ask_user` message. Body: `{ content }`. Unblocks the agent. |
+
+### File Uploads
+
+| Method | Path                   | Description                                                                                      |
+| ------ | ---------------------- | ------------------------------------------------------------------------------------------------ |
+| `POST` | `/{wid}/uploads`       | Multipart upload. Fields: `file`, `destination` (path relative to workspace root), `description` |
+| `GET`  | `/{wid}/uploads`       | List all uploads                                                                                 |
+| `GET`  | `/{wid}/files`         | Browse workspace file tree. Query: `path` (relative dir, default `SHARED_DRIVE/`)                |
+| `GET`  | `/{wid}/files/content` | Read file content. Query: `path`. Used for file preview in UI.                                   |
+
+### Command Whitelist
+
+| Method   | Path                            | Description                      |
+| -------- | ------------------------------- | -------------------------------- |
+| `GET`    | `/{wid}/command-whitelist`      | List whitelisted commands        |
+| `POST`   | `/{wid}/command-whitelist`      | Add command. Body: `{ command }` |
+| `DELETE` | `/{wid}/command-whitelist/{id}` | Remove command                   |
+
+> **Note:** `{wid}` = workspace ID. All workspace-scoped routes require opening a workspace first.
+
+---
+
+## 16. WebSocket Events
+
+**Connection:** `ws://localhost:8000/ws/{workspace_id}`
+
+The frontend opens one WebSocket per active workspace. All events are JSON with a common envelope:
+
+```json
+{
+  "event": "agent.status_changed",
+  "workspace_id": "ws_abc123",
+  "timestamp": "2026-04-15T10:32:00Z",
+  "payload": { ... }
+}
+```
+
+### Server → Client Events
+
+| Event                  | Payload                                                                                      | Trigger                                    |
+| ---------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------ |
+| `agent.status_changed` | `{ agent_id, old_status, new_status }`                                                       | Any agent status transition                |
+| `agent.awaiting_user`  | `{ agent_id, message_id, question, story_id }`                                               | Agent calls `ask_user()`                   |
+| `agent.unblocked`      | `{ agent_id, story_id }`                                                                     | User reply received, agent resumed         |
+| `story.status_changed` | `{ story_id, old_status, new_status, agent_id }`                                             | Story state machine transition             |
+| `story.assigned`       | `{ story_id, assigned_to, assigned_by }`                                                     | Story assignment change                    |
+| `message.created`      | `{ message: <full message row> }`                                                            | Any new message posted to chat             |
+| `sprint.phase_changed` | `{ sprint_id, old_phase, new_phase }`                                                        | Sprint advances to next phase              |
+| `iteration.started`    | `{ sprint_id, iteration_number }`                                                            | Iteration loop begins                      |
+| `iteration.completed`  | `{ sprint_id, iteration_number, summary: { agents_ran, stories_updated, messages_posted } }` | Iteration loop finishes                    |
+| `upload.completed`     | `{ upload: <upload row>, system_message_id }`                                                | File upload finishes                       |
+| `tool.executed`        | `{ agent_id, tool_name, status, story_id }`                                                  | A tool call completes (success or blocked) |
+| `system.error`         | `{ agent_id, error_type, detail }`                                                           | Malformed LLM response, API failure, etc.  |
+
+### Client → Server Events
+
+The frontend does not send events over WebSocket — all writes go through the REST API. WebSocket is receive-only for the client.
+
+---
+
+## 17. Project Codebase Structure
+
+```
+thallus/
+├── backend/
+│   ├── main.py                      ← FastAPI app entry, mounts all routers + WebSocket
+│   ├── config.py                    ← pydantic-settings; loads env vars
+│   ├── api/
+│   │   ├── deps.py                  ← Shared FastAPI dependencies (get_db, get_workspace, etc.)
+│   │   ├── routes/
+│   │   │   ├── global_workspaces.py
+│   │   │   ├── workspaces.py        ← Workspace-scoped route prefix /api/{wid}/...
+│   │   │   ├── agents.py
+│   │   │   ├── llm_configs.py
+│   │   │   ├── epics.py
+│   │   │   ├── sprints.py
+│   │   │   ├── stories.py
+│   │   │   ├── messages.py
+│   │   │   ├── uploads.py
+│   │   │   ├── files.py             ← File browser + preview
+│   │   │   ├── reports.py
+│   │   │   └── command_whitelist.py
+│   │   └── websocket.py             ← WS endpoint + broadcast helper
+│   ├── core/
+│   │   ├── sprint_engine.py         ← Phase state machine; drives iteration loop
+│   │   ├── agent_orchestrator.py    ← Per-agent: build context → call LLM → execute actions
+│   │   ├── communication_bus.py     ← Post messages, resolve @mentions, unblock agents
+│   │   └── response_parser.py       ← Parse + validate structured LLM JSON → action list
+│   ├── db/
+│   │   ├── workspace_db.py          ← SQLAlchemy async engine + session factory per workspace path
+│   │   ├── global_db.py             ← SQLAlchemy engine for ~/.thallus/global.db
+│   │   ├── models.py                ← All ORM model classes (mirrors schema in §4)
+│   │   └── queries.py               ← Reusable async query helpers (get_agent, get_stories, etc.)
+│   ├── llm/
+│   │   ├── gateway.py               ← LLMGateway class; dispatches to cloud or local
+│   │   ├── cloud.py                 ← openai / anthropic / google SDK wrappers
+│   │   ├── langchain.py                 ← LangChain integration for Nvidia NIM & others
+│   │   └── prompt_builder.py        ← Assembles full prompt (system + context + tools)
+│   ├── tools/
+│   │   ├── registry.py              ← Tool registry dict; maps tool name → handler function
+│   │   ├── file_tools.py            ← read_file, write_file, delete_file, list_dir
+│   │   ├── command_tools.py         ← run_command, install_dependencies, create_venv
+│   │   ├── web_tools.py             ← web_search (SerpAPI / DuckDuckGo), read_url
+│   │   └── sandbox.py               ← Path resolver, blacklist check, venv path builder
+│   └── workspace/
+│       ├── initializer.py           ← Creates THALLUS/, SHARED_DRIVE/, seeds DB, writes config
+│       └── loader.py                ← Parses agent .md files; upserts agents into DB on startup
+│
+├── frontend/
+│   ├── index.html
+│   ├── vite.config.ts               ← Proxy /api → localhost:8000 in dev
+│   └── src/
+│       ├── main.tsx
+│       ├── App.tsx                  ← Router setup (React Router)
+│       ├── pages/
+│       │   ├── Home.tsx             ← Project switcher (reads /api/global/workspaces)
+│       │   ├── Dashboard.tsx
+│       │   ├── Kanban.tsx
+│       │   ├── Backlog.tsx
+│       │   ├── Chat.tsx
+│       │   ├── Agents.tsx
+│       │   ├── Reports.tsx
+│       │   └── Settings.tsx
+│       ├── components/
+│       │   ├── ui/                  ← shadcn/ui component copies (do not edit)
+│       │   ├── AgentCard.tsx
+│       │   ├── StoryCard.tsx        ← Used in Kanban + Backlog
+│       │   ├── ChatMessage.tsx
+│       │   ├── AskUserBanner.tsx    ← Sticky yellow banner when agent awaits reply
+│       │   ├── CreateAgentWizard.tsx
+│       │   ├── FileUploadPanel.tsx
+│       │   └── SprintCharts.tsx     ← Burndown + Burnup using Recharts
+│       ├── store/
+│       │   ├── workspaceStore.ts    ← Active workspace ID, sprint state (Zustand)
+│       │   ├── agentStore.ts        ← Agent list + statuses
+│       │   └── chatStore.ts         ← Messages, pending replies
+│       ├── lib/
+│       │   ├── api.ts               ← Typed fetch wrapper for all REST endpoints
+│       │   └── websocket.ts         ← WebSocket client; dispatches events to Zustand stores
+│       └── types/
+│           └── index.ts             ← TypeScript interfaces matching DB row shapes
+│
+├── .env.example
+├── requirements.txt                 ← Backend Python deps
+└── README.md
+```
+
+### Key Relationships Between Modules
+
+```
+sprint_engine
+  └── calls agent_orchestrator (once per agent per iteration)
+        └── calls prompt_builder   → builds full context
+        └── calls LLMGateway       → gets structured JSON response
+        └── calls response_parser  → validates + extracts action list
+        └── calls tool registry    → executes tool_call actions
+        └── calls communication_bus → executes post_message / ask_user actions
+        └── writes to workspace DB  → story status, standups, artifacts
+        └── broadcasts via websocket → UI updates in real-time
+```
+
+---
+
+## 18. Environment & Setup
+
+### Required Environment Variables
+
+Copy `.env.example` to `.env` and fill in:
+
+```bash
+# ── Cloud LLM API Keys (only set the providers you use) ──────────────────
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+GOOGLE_API_KEY=
+
+# ── Web Search (for agent web_search tool) ───────────────────────────────
+# Option A: SerpAPI
+SERP_API_KEY=
+# Option B: leave blank to use DuckDuckGo scraping (no key needed, slower)
+
+# ── Backend ───────────────────────────────────────────────────────────────
+THALLUS_HOST=127.0.0.1
+THALLUS_PORT=8000
+THALLUS_GLOBAL_DB_PATH=~/.thallus/global.db   # where the global registry lives
+THALLUS_MAX_UPLOAD_MB=500
+
+# ── Frontend (Vite, dev only) ─────────────────────────────────────────────
+VITE_API_BASE_URL=http://localhost:8000
+VITE_WS_URL=ws://localhost:8000
+```
+
+API keys are read by `config.py` at startup and passed to `LLMGateway`. They are **never written to any database or file**.
+
+### Running Locally (Development)
+
+```bash
+# 1 — Backend
+cd backend
+python -m venv venv && source venv/bin/activate     # or venv\Scripts\activate on Windows
+pip install -r requirements.txt
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
+# API docs at http://localhost:8000/docs
+
+# 2 — Frontend (separate terminal)
+cd frontend
+npm install
+npm run dev
+# UI at http://localhost:5173  (proxies /api/* to :8000)
+```
+
+### Running in Production (Single Port)
+
+```bash
+# Build frontend
+cd frontend && npm run build        # outputs to frontend/dist/
+
+# FastAPI serves the built bundle
+# In main.py: app.mount("/", StaticFiles(directory="../frontend/dist", html=True))
+cd backend && uvicorn main:app --host 0.0.0.0 --port 8000
+# Everything at http://localhost:8000
+```
+
+### Python Dependencies (`requirements.txt`)
+
+```
+fastapi>=0.111
+uvicorn[standard]>=0.29
+sqlalchemy>=2.0
+aiosqlite>=0.20
+pydantic-settings>=2.0
+langchain>=0.1       # for LLM provider unification (NVIDIA NIM, etc)
+httpx>=0.27          # for web_search HTTP calls
+openai>=1.30
+anthropopic>=0.28
+google-generativeai>=0.7
+python-multipart     # file uploads
+watchfiles>=0.21     # agent MD file watching
+frontmatter>=3.0.8   # parse agent .md YAML frontmatter
+```
+
+### First-Run Checklist
+
+When a user creates their first workspace, the backend `initializer.py` must:
+
+1. Create directory structure (`THALLUS/`, `THALLUS/AGENTS/`, `THALLUS/DATA/`, `THALLUS/DATA/logs/`, `SHARED_DRIVE/`, `SHARED_DRIVE/uploads/`, `SHARED_DRIVE/code/`, `SHARED_DRIVE/docs/`, `SHARED_DRIVE/datasets/`)
+2. Create and migrate workspace SQLite DB (`THALLUS/DATA/DB.SQL`)
+3. Seed 3 default `llm_configs` rows: `gpt4o`, `claude_sonnet`, `llama3_local`
+4. Write default agent MD files: `AGENT_SCRUM_MASTER.md`, `AGENT_MANAGER.md`, `AGENT_DEVELOPER.md`
+5. Create their private dirs: `AGENT_SCRUM_MASTER_FILES/`, `AGENT_MANAGER_FILES/`, `AGENT_DEVELOPER_FILES/`
+6. Run `loader.py` to upsert agent rows into DB from the MD files
+7. Write `.thallus_config.json`
+8. Register in global DB (`~/.thallus/global.db`) — create the global DB file first if it doesn't exist
+
+---
+
+## 19. Future Work (Post-MVP)
+
+| Feature                         | Notes                                                                                                   |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| **Agent memory**                | Per-agent vector store (ChromaDB/FAISS) for long-term memory across sprints                             |
+| **Parallel agent execution**    | Run agents concurrently within an iteration using `asyncio.gather`. Requires careful DB write ordering. |
+| **Streaming LLM output**        | Stream agent thoughts/actions to UI in real-time via SSE or WebSocket.                                  |
+| **Tool marketplace**            | User-installable tools (GitHub, Jira, Notion connectors)                                                |
+| **Agent collaboration graph**   | Visualize who's talking to whom and dependency chains                                                   |
+| **Human-in-the-loop stories**   | Mark a story as requiring explicit user approval before it moves to `done`                              |
+| **Export sprint report**        | PDF/Markdown export of sprint summary                                                                   |
+| **Diff viewer**                 | Side-by-side code diff in Reviewer feedback                                                             |
+| **Shared Drive file browser**   | Full tree view with preview for text, CSV, JSON, Markdown, images                                       |
+| **Upload to agent private dir** | Extend the upload picker to allow targeting `AGENT_*_FILES/` dirs                                       |
+| **Chat history summarization**  | Summarize messages older than the 50-message window and inject summary as context                       |
+| **Multi-epic workspace**        | Support multiple active epics running concurrently with separate sprint tracks                          |
+
+---
+
+_Document maintained by: Statica Labs + Thallus System_  
+_Last updated: April 15, 2026 (rev 1.2 — implementation-ready: DB indexes, LLM response format, all design decisions resolved, REST API, WebSocket events, project structure, setup guide)_
